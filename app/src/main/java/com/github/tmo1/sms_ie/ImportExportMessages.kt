@@ -25,6 +25,7 @@
 
 package com.github.tmo1.sms_ie
 
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
@@ -37,6 +38,9 @@ import android.widget.TextView
 import androidx.annotation.RequiresApi
 import androidx.preference.PreferenceManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,6 +49,7 @@ import java.io.InputStreamReader
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+
 
 data class MmsBinaryPart(val uri: Uri, val filename: String)
 
@@ -108,22 +113,86 @@ suspend fun exportMessages(
     }
 }
 
+private val SINGLE_CANONICAL_ADDRESS_URI = Uri.parse("content://mms-sms/canonical-address")
+private val ALL_THREADS_URI: Uri =
+    Telephony.Threads.CONTENT_URI.buildUpon().appendQueryParameter("simple", "true").build()
+private val SMS_RECIPIENTS_PROJECTION = arrayOf(
+    Telephony.Threads._ID, Telephony.Threads.RECIPIENT_IDS
+)
+
+private fun getThreadRecipients(appContext: Context, threadId: Long): JSONArray? =
+    appContext.contentResolver.query(
+        ALL_THREADS_URI, SMS_RECIPIENTS_PROJECTION, "_id=?", arrayOf(threadId.toString()), null
+    )?.use {
+        if (it.moveToFirst()) {
+            it.getString(1)
+        } else {
+            return null
+        }
+    }?.let {
+        if (it.isNotBlank()) {
+            it
+        } else {
+            return null
+        }
+    }?.split(" ".toRegex())?.filter { it.isNotBlank() }?.mapNotNull { stringId ->
+        val longId = try {
+            stringId.toLong()
+        } catch (ex: NumberFormatException) {
+            Log.e(LOG_TAG, "getThreadRecipients: invalid thread id $stringId", ex)
+            return@mapNotNull null
+        }
+
+        try {
+            appContext.contentResolver.query(
+                ContentUris.withAppendedId(SINGLE_CANONICAL_ADDRESS_URI, longId),
+                null,
+                null,
+                null,
+                null
+            )
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "getThreadRecipients: query failed for id $longId", e)
+            return@mapNotNull null
+        }?.use { canonicalAddressCursor ->
+            if (canonicalAddressCursor.moveToFirst()) {
+                canonicalAddressCursor.getString(0).let { canonicalAddress ->
+                    if (!canonicalAddress.isNullOrBlank()) {
+                        canonicalAddress
+                    } else {
+                        Log.d(
+                            LOG_TAG, "Canonical MMS/SMS address is empty for id: $longId"
+                        )
+                        null
+                    }
+                }
+            } else {
+                null
+            }
+        }
+    }?.let {
+        JSONArray(it.toHashSet())
+    }
+
+
 private suspend fun smsToJSON(
     appContext: Context,
     zipOutputStream: ZipOutputStream,
     displayNames: MutableMap<String, String?>,
     progressBar: ProgressBar?,
     statusReportText: TextView?
-): Int {
+): Int = coroutineScope {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     var total = 0
     val smsCursor =
         appContext.contentResolver.query(Telephony.Sms.CONTENT_URI, null, null, null, null)
+    val threadRecipientsMap = HashMap<Long, JSONArray?>()
     smsCursor?.use {
         if (it.moveToFirst()) {
             initProgressBar(progressBar, it)
             val totalSms = it.count
             val addressIndex = it.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+            val threadIndex = it.getColumnIndexOrThrow(Telephony.Sms.THREAD_ID)
             do {
                 val smsMessage = JSONObject()
                 it.columnNames.forEachIndexed { i, columnName ->
@@ -135,19 +204,37 @@ private suspend fun smsToJSON(
                     val displayName = lookupDisplayName(appContext, displayNames, address)
                     if (displayName != null) smsMessage.put("__display_name", displayName)
                 }
+
+                it.getLong(threadIndex).let { threadId ->
+                    if (threadRecipientsMap.containsKey(threadId)) {
+                        threadRecipientsMap.get(threadId)
+                    } else {
+                        getThreadRecipients(appContext, threadId).also { recipients ->
+                            threadRecipientsMap.put(threadId, recipients)
+                        }
+                    }?.let { recipients ->
+                        smsMessage.put("__recipients", recipients)
+                    }
+                }
+
                 zipOutputStream.write((smsMessage.toString() + "\n").toByteArray())
                 total++
-                incrementProgress(progressBar)
-                setStatusText(
-                    statusReportText,
-                    appContext.getString(R.string.sms_export_progress, total, totalSms)
-                )
+
+                launch {
+                    incrementProgress(progressBar)
+                    setStatusText(
+                        statusReportText,
+                        appContext.getString(R.string.sms_export_progress, total, totalSms)
+                    )
+                }
+
+
                 if (total == (prefs.getString("max_records", "")?.toIntOrNull() ?: -1)) break
             } while (it.moveToNext())
             hideProgressBar(progressBar)
         }
     }
-    return total
+    return@coroutineScope total
 }
 
 private suspend fun mmsToJSON(
@@ -300,14 +387,14 @@ suspend fun importMessages(
             appContext.contentResolver.query(Telephony.Sms.CONTENT_URI, null, null, null, null)
         smsCursor?.use {
             smsColumns.addAll(it.columnNames)
-            smsColumns.removeAll(setOf("_id", "thread_id"))
+            smsColumns.removeAll(setOf("_id", Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS))
         }
         val mmsColumns = mutableSetOf<String>()
         val mmsCursor =
             appContext.contentResolver.query(Telephony.Mms.CONTENT_URI, null, null, null, null)
         mmsCursor?.use {
             mmsColumns.addAll(it.columnNames)
-            mmsColumns.removeAll(setOf("_id", "thread_id"))
+            mmsColumns.removeAll(setOf("_id", Telephony.Mms.THREAD_ID))
         }
         val partColumns = mutableSetOf<String>()
         // I can't find an officially documented way of getting the Part table URI for API < 29
@@ -388,12 +475,6 @@ suspend fun importMessages(
                                         Log.d(LOG_TAG, "Skipping due to debug settings")
                                         return@JSONLine
                                     }
-                                    // I haven't been able to figure out how to properly insert SMS messages with multiple recipients
-                                    // https://github.com/tmo1/sms-ie/issues/159
-                                    if (messageJSON.optString(Telephony.Sms.ADDRESS).split(" ").size > 1) {
-                                        Log.d(LOG_TAG, "SMS has multiple recipients - skipping")
-                                        return@JSONLine
-                                    }
                                     if (deduplication) {
                                         val smsDuplicatesCursor = appContext.contentResolver.query(
                                             Telephony.Sms.CONTENT_URI,
@@ -424,10 +505,36 @@ suspend fun importMessages(
                                        between the old and new ones in 'threadIdMap'
                                     */
                                     if (!messageMetadata.containsKey("thread_id")) {
-                                        val newThreadId = Telephony.Threads.getOrCreateThreadId(
-                                            appContext,
-                                            messageMetadata.getAsString(Telephony.TextBasedSmsColumns.ADDRESS)
-                                        )
+                                        val newThreadId = messageJSON.optJSONArray("__recipients")
+                                            ?.let { recipients ->
+                                                val recipientsSet = HashSet<String>()
+                                                for (i in 0..recipients.length() - 1) {
+                                                    val item = recipients.get(i)
+                                                    if (item is String) {
+                                                        recipientsSet.add(item)
+                                                    } else {
+                                                        Log.e(
+                                                            LOG_TAG,
+                                                            "non-String recipient ${item}"
+                                                        )
+                                                    }
+                                                }
+                                                if (!recipientsSet.isEmpty()) Telephony.Threads.getOrCreateThreadId(
+                                                    appContext,
+                                                    recipientsSet
+                                                )
+                                                else null
+                                            } ?: messageJSON.getString(Telephony.Sms.ADDRESS)
+                                            .let { address ->
+                                                messageMetadata.put(
+                                                    Telephony.Sms.ADDRESS, address
+                                                )
+                                                Telephony.Threads.getOrCreateThreadId(
+                                                    appContext,
+                                                    address
+                                                )
+                                            }
+
                                         messageMetadata.put("thread_id", newThreadId)
                                         if (oldThreadId != "") {
                                             threadIdMap[oldThreadId] = newThreadId.toString()
